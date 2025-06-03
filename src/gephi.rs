@@ -14,10 +14,18 @@ impl GephiClient {
         }
     }
 
-    pub async fn add_node(&self, node_id: &str, label: &str) -> Result<Value, reqwest::Error> {
+    pub async fn add_node(
+        &self,
+        node_id: &str,
+        label: &str,
+        depth: usize,
+    ) -> Result<Value, reqwest::Error> {
         let body = json!({
             "an": {
-                node_id: { "label": label }
+                node_id: {
+                    "label": label,
+                    "depth": depth
+                }
             }
         });
 

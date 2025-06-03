@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::runtime;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 #[derive(Clone)]
 pub struct CrawlerData {
@@ -22,6 +22,7 @@ pub struct CrawlerData {
 pub struct Crawler {
     pub data: Arc<CrawlerData>,
     pub tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<Result<()>>>>>,
+    pub send_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<Result<()>>>>>,
     pub gephi_client: Option<Arc<Mutex<GephiClient>>>,
 }
 
@@ -39,6 +40,7 @@ impl Crawler {
                 visited_urls: DashMap::new(),
             }),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            send_tasks: Arc::new(Mutex::new(Vec::new())),
             gephi_client,
         }
     }
@@ -71,11 +73,20 @@ impl Crawler {
         self.tasks.lock().await.push(task);
     }
 
-    pub async fn gephi_add(&self, source: &str, target: &str) -> Result<()> {
+    pub async fn add_send_task(
+        &self,
+        task: tokio::task::JoinHandle<Result<()>>,
+    ) {
+        self.send_tasks.lock().await.push(task);
+    }
+
+    pub async fn gephi_add(&self, source: &str, target: &str, depth: usize) -> Result<()> {
         if let Some(client) = &self.gephi_client {
+            info!("Adding edge from {} to {} at depth {}", source, target, depth);
+
             let client = client.lock().await;
-            client.add_node(source, source).await?;
-            client.add_node(target, target).await?;
+            client.add_node(source, source, depth).await?;
+            client.add_node(target, target, depth + 1).await?;
             client
                 .add_edge(&format!("{}-{}", source, target), source, target, true)
                 .await?;
@@ -107,6 +118,26 @@ impl Crawler {
 
     pub async fn wait_for_tasks(&self) -> Result<()> {
         loop {
+            {
+                let send_tasks: Vec<_> = {
+                    let mut locked = self.send_tasks.lock().await;
+                    std::mem::take(&mut *locked)
+                };
+
+                let results = futures::future::join_all(send_tasks).await;
+
+                for result in results {
+                    if let Err(e) = result {
+                        error!("Send task failed: {:?}", e);
+                    } else {
+                        if let Err(e) = result {
+                            error!("Send task failed with error: {:?}", e);
+                        }
+                    }
+                }
+            }
+
+            {
             let tasks: Vec<_> = {
                 let mut locked = self.tasks.lock().await;
                 if locked.is_empty() {
@@ -125,6 +156,7 @@ impl Crawler {
                         error!("Task failed with error: {:?}", e);
                     }
                 }
+            }
             }
         }
 
@@ -165,7 +197,7 @@ impl Crawler {
                 }
             }
             if !allowed {
-                debug!("URL {} does not match any filter, skipping", url);
+                info!("Skipping: {} (not in filters)", url);
                 return Ok(());
             }
         }
@@ -178,7 +210,7 @@ impl Crawler {
                 }
             }
             if ignored {
-                debug!("URL {} matches ignore pattern, skipping", url);
+                info!("Skipping: {} (in ignore list)", url);
                 return Ok(());
             }
         }
@@ -192,7 +224,7 @@ impl Crawler {
             found_at: from.clone(),
             depth,
         });
-        self.add_task(self.spawn_add_gephi(from.clone(), url.clone()))
+        self.add_send_task(self.spawn_add_gephi(from.clone(), url.clone(), depth))
             .await;
 
         info!("Crawling (depth: {}): {}", depth, url);
@@ -211,7 +243,6 @@ impl Crawler {
                 response.status()
             ));
         }
-        info!("Fetched: {}", url);
 
         if depth + 1 > self.args().depth as usize {
             return Ok(());
@@ -222,7 +253,6 @@ impl Crawler {
             .await
             .context("Failed to read response text")?;
         let links = self.extract_links(&html);
-
         info!("Found {} links on {} at depth {}", links.len(), url, depth);
 
         for link in links {
@@ -247,9 +277,10 @@ impl Crawler {
         &self,
         source: String,
         target: String,
+        depth: usize,
     ) -> tokio::task::JoinHandle<Result<()>> {
         let crawler = self.clone();
-        tokio::spawn(async move { crawler.gephi_add(&source, &target).await })
+        tokio::spawn(async move { crawler.gephi_add(&source, &target, depth).await })
     }
 
     fn extract_links(&self, html: &str) -> Vec<String> {
