@@ -1,14 +1,19 @@
+use ferris_the_crawler::{Args, Crawler};
+
 use anyhow::Result;
-use crawler::Crawler;
+use clap::Parser;
 use tracing::info;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    let args = Args::parse();
+    info!("Starting crawler with args: {:?}", args);
+
     #[cfg(feature = "flamegraph")]
     let guard = pprof::ProfilerGuard::new(100).unwrap();
 
-    let crawler = Crawler::new("https://github.com/sindresorhus/awesome".to_string(), 1);
+    let crawler = Crawler::new(args);
 
     crawler.crawl()?;
     info!(
@@ -16,8 +21,10 @@ fn main() -> Result<()> {
         crawler.urls().len()
     );
 
-    let exporter = crawler.exporter();
-    exporter.to_file("data.csv")?;
+    if let Some(output) = &crawler.args().output {
+        crawler.exporter().to_file(output)?;
+        info!("Data exported to file: {}", output);
+    }
 
     #[cfg(feature = "flamegraph")]
     {
