@@ -73,23 +73,42 @@ impl Crawler {
         self.tasks.lock().await.push(task);
     }
 
-    pub async fn add_send_task(
-        &self,
-        task: tokio::task::JoinHandle<Result<()>>,
-    ) {
+    pub async fn add_send_task(&self, task: tokio::task::JoinHandle<Result<()>>) {
         self.send_tasks.lock().await.push(task);
     }
 
     pub async fn gephi_add(&self, source: &str, target: &str, depth: usize) -> Result<()> {
+        match self.args().command {
+            crate::args::Command::Wiki { amount: _, link: _ } => {
+                if source.contains("Random") {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+
         if let Some(client) = &self.gephi_client {
-            info!("Adding edge from {} to {} at depth {}", source, target, depth);
+            info!(
+                "Adding edge from {} to {} at depth {}",
+                source, target, depth
+            );
 
             let client = client.lock().await;
-            client.add_node(source, source, depth).await?;
-            client.add_node(target, target, depth + 1).await?;
-            client
+            match client.add_node(source, source, depth).await {
+                Ok(_) => info!("Node {} added successfully", source),
+                Err(e) => error!("Failed to add node {}: {:?}", source, e),
+            };
+            match client.add_node(target, target, depth + 1).await {
+                Ok(_) => info!("Node {} added successfully", target),
+                Err(e) => error!("Failed to add node {}: {:?}", target, e),
+            };
+            match client
                 .add_edge(&format!("{}-{}", source, target), source, target, true)
-                .await?;
+                .await
+            {
+                Ok(_) => info!("Edge {} -> {} added successfully", source, target),
+                Err(e) => error!("Failed to add edge {} -> {}: {:?}", source, target, e),
+            };
         }
 
         Ok(())
@@ -103,12 +122,26 @@ impl Crawler {
             .context("Failed to create Tokio runtime")?;
 
         rt.block_on(async {
-            self.add_task(self.spawn_crawl(
-                self.args().url.to_string(),
-                self.args().url.to_string(),
-                0,
-            ))
-            .await;
+            match self.args().command {
+                crate::args::Command::Html => {
+                    self.add_task(self.spawn_crawl(
+                        self.args().url.to_string(),
+                        self.args().url.to_string(),
+                        0,
+                    ))
+                    .await;
+                }
+                crate::args::Command::Wiki { amount, link: _ } => {
+                    for _ in 0..amount {
+                        self.add_task(self.spawn_crawl(
+                            self.args().url.to_string(),
+                            self.args().url.to_string(),
+                            0,
+                        ))
+                        .await;
+                    }
+                }
+            }
 
             self.wait_for_tasks().await?;
 
@@ -116,69 +149,23 @@ impl Crawler {
         })
     }
 
-    pub async fn wait_for_tasks(&self) -> Result<()> {
-        loop {
-            {
-                let send_tasks: Vec<_> = {
-                    let mut locked = self.send_tasks.lock().await;
-                    std::mem::take(&mut *locked)
-                };
-
-                let results = futures::future::join_all(send_tasks).await;
-
-                for result in results {
-                    if let Err(e) = result {
-                        error!("Send task failed: {:?}", e);
-                    } else {
-                        if let Err(e) = result {
-                            error!("Send task failed with error: {:?}", e);
-                        }
-                    }
-                }
-            }
-
-            {
-            let tasks: Vec<_> = {
-                let mut locked = self.tasks.lock().await;
-                if locked.is_empty() {
-                    break;
-                }
-                std::mem::take(&mut *locked)
-            };
-
-            let results = futures::future::join_all(tasks).await;
-
-            for result in results {
-                if let Err(e) = result {
-                    error!("Task failed: {:?}", e);
-                } else {
-                    if let Err(e) = result {
-                        error!("Task failed with error: {:?}", e);
-                    }
-                }
-            }
-            }
+    async fn crawl_html_url(&self, url: String, from: String, depth: usize) -> Result<()> {
+        if depth > self.args().depth as usize {
+            return Ok(());
         }
 
-        Ok(())
-    }
-
-    async fn crawl_url(&self, url: String, from: String, depth: usize) -> Result<()> {
         let mut url = url;
-
         if url.starts_with("/") {
             let base_url = self.args().url.clone();
             let full_url = format!("{}{}", base_url, url);
             url = full_url;
         }
-
         let url_struct: url::Url = match url.parse() {
             Ok(parsed_url) => parsed_url,
             Err(_) => {
                 return Ok(());
             }
         };
-
         let url = match self.args().ignore_query {
             false => url_struct.to_string(),
             true => {
@@ -215,7 +202,11 @@ impl Crawler {
             }
         }
 
-        if depth > self.args().depth as usize || self.is_visited(&url) {
+        self.add_send_task(self.spawn_add_gephi(from.clone(), url.clone(), depth))
+            .await;
+
+        if self.is_visited(&url) {
+            info!("Already visited: {}", url);
             return Ok(());
         }
 
@@ -224,8 +215,11 @@ impl Crawler {
             found_at: from.clone(),
             depth,
         });
-        self.add_send_task(self.spawn_add_gephi(from.clone(), url.clone(), depth))
-            .await;
+
+        if depth + 1 > self.args().depth as usize {
+            info!("Max depth: {}", url);
+            return Ok(());
+        }
 
         info!("Crawling (depth: {}): {}", depth, url);
         let client = reqwest::Client::new();
@@ -235,7 +229,6 @@ impl Crawler {
             .send()
             .await
             .context(format!("Failed to send request to {}", &url))?;
-
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
                 "Request to {} failed with status: {}",
@@ -243,10 +236,7 @@ impl Crawler {
                 response.status()
             ));
         }
-
-        if depth + 1 > self.args().depth as usize {
-            return Ok(());
-        }
+        info!("Fetched: {}", url);
 
         let html = response
             .text()
@@ -258,6 +248,162 @@ impl Crawler {
         for link in links {
             self.add_task(self.spawn_crawl(link, url.clone(), depth + 1))
                 .await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn wait_for_tasks(&self) -> Result<()> {
+        let self_clone1 = self.clone();
+        let self_clone2 = self.clone();
+
+        let send_task_loop = tokio::spawn(async move {
+            loop {
+                let send_tasks: Vec<_> = {
+                    let mut locked = self_clone1.send_tasks.lock().await;
+                    std::mem::take(&mut *locked)
+                };
+
+                if !send_tasks.is_empty() {
+                    let results = futures::future::join_all(send_tasks).await;
+
+                    for result in results {
+                        if let Err(e) = result {
+                            error!("Send task failed: {:?}", e);
+                        }
+                    }
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+
+        let regular_task_loop = tokio::spawn(async move {
+            loop {
+                let tasks: Vec<_> = {
+                    let mut locked = self_clone2.tasks.lock().await;
+                    if locked.is_empty() {
+                        break;
+                    }
+                    std::mem::take(&mut *locked)
+                };
+
+                let results = futures::future::join_all(tasks).await;
+
+                for result in results {
+                    if let Err(e) = result {
+                        error!("Task failed: {:?}", e);
+                    }
+                }
+            }
+        });
+
+        // Wait for regular tasks to finish; send_task_loop is infinite, so we detach it.
+        let (_, regular_result) = futures::join!(send_task_loop, regular_task_loop);
+        regular_result.map_err(|e| anyhow::anyhow!("Task join error: {:?}", e))?;
+
+        Ok(())
+    }
+
+    async fn crawl_url(&self, url: String, from: String, depth: usize) -> Result<()> {
+        match self.args().command {
+            crate::args::Command::Html => self.crawl_html_url(url, from, depth).await,
+            crate::args::Command::Wiki { amount: _, link: _ } => {
+                self.crawl_wiki_url(url, from, depth).await
+            }
+        }
+    }
+
+    async fn crawl_wiki_url(&self, url: String, from: String, depth: usize) -> Result<()> {
+        if depth > self.args().depth as usize {
+            return Ok(());
+        }
+
+        self.add_send_task(self.spawn_add_gephi(from.clone(), url.clone(), depth))
+            .await;
+
+        if self.is_visited(&url) {
+            info!("Already visited: {}", url);
+            return Ok(());
+        }
+
+        if !url.contains("Random") {
+            tracing::warn!("Crawling non-random URL: {}", url);
+            let parts = url.split("/wiki/").collect::<Vec<_>>();
+            if parts.len() < 2 {
+                info!("Invalid URL format: {}", url);
+                return Ok(());
+            }
+            if parts[1].contains(":") || parts[1].contains("#") {
+                info!("Skipping non-article URL: {}", url);
+                return Ok(());
+            }
+
+            self.add_visited_url(Url {
+                url: url.clone(),
+                found_at: from.clone(),
+                depth,
+            });
+        }
+
+        if depth + 1 > self.args().depth as usize {
+            info!("Max depth: {}", url);
+            return Ok(());
+        }
+
+        info!("Crawling (depth: {}): {}", depth, url);
+        let reqsponse = reqwest::get(&url)
+            .await
+            .context(format!("Failed to send request to {}", &url))?;
+        let html = reqsponse
+            .text()
+            .await
+            .context("Failed to read response text")?;
+        info!("Fetched: {}", url);
+
+        let links = {
+            let doc = Html::parse_document(&html);
+            let selector =
+                Selector::parse("#mw-content-text .mw-parser-output p a[href^=\"/wiki/\"]")
+                    .unwrap();
+
+            doc.select(&selector)
+                .filter_map(|element| {
+                    let href = element.value().attr("href")?;
+                    if href.contains(":") || href.contains("#") {
+                        return None;
+                    }
+                    let full_url = url::Url::parse("https://en.wikipedia.org")
+                        .ok()?
+                        .join(href)
+                        .ok()?;
+                    Some(full_url.to_string())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        match self.args().command {
+            crate::args::Command::Wiki { amount: _, link } => {
+                if link.is_none() {
+                    for link in links {
+                        self.add_task(self.spawn_crawl(link, url.clone(), depth + 1))
+                            .await;
+                    }
+                } else {
+                    if links.len() as u32 > link.unwrap() {
+                        self.add_task(self.spawn_crawl(
+                            links[link.unwrap() as usize].clone(),
+                            url.clone(),
+                            depth + 1,
+                        ))
+                        .await;
+                    } else {
+                        info!("No link found on {}", url);
+                        return Ok(());
+                    }
+                }
+            }
+            _ => {}
         }
 
         Ok(())

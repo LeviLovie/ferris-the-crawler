@@ -1,8 +1,11 @@
-use clap::{Parser, ValueHint};
+use clap::{Parser, Subcommand, ValueHint};
 
 #[derive(Parser, Clone, Debug)]
 #[command(version, about)]
 pub struct Args {
+    #[clap(subcommand)]
+    pub command: Command,
+
     #[clap(
         short = 'u',
         long = "url",
@@ -64,4 +67,26 @@ pub struct Args {
         default_value = "http://localhost:8088/workspace1"
     )]
     pub gephi_url: String,
+}
+
+#[derive(Subcommand, Clone, Debug)]
+pub enum Command {
+    Html,
+    Wiki {
+        #[clap(
+            short = 'a',
+            long = "amount",
+            help = "The amount of links to crawl",
+            default_value = "10"
+        )]
+        amount: u32,
+
+        #[clap(
+            short = 'n',
+            long = "link",
+            help = "The link to use by id",
+            default_value = "1"
+        )]
+        link: Option<u32>,
+    },
 }

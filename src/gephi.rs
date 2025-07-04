@@ -1,5 +1,5 @@
 use reqwest::Client;
-use serde_json::{Value, json};
+use serde_json::json;
 
 pub struct GephiClient {
     base_url: String,
@@ -19,7 +19,7 @@ impl GephiClient {
         node_id: &str,
         label: &str,
         depth: usize,
-    ) -> Result<Value, reqwest::Error> {
+    ) -> Result<String, reqwest::Error> {
         let body = json!({
             "an": {
                 node_id: {
@@ -35,7 +35,7 @@ impl GephiClient {
             .json(&body)
             .send()
             .await?
-            .json::<Value>()
+            .text()
             .await?;
 
         Ok(res)
@@ -47,7 +47,7 @@ impl GephiClient {
         source: &str,
         target: &str,
         directed: bool,
-    ) -> Result<Value, reqwest::Error> {
+    ) -> Result<String, reqwest::Error> {
         let body = json!({
             "ae": {
                 edge_id: {
@@ -64,7 +64,7 @@ impl GephiClient {
             .json(&body)
             .send()
             .await?
-            .json::<Value>()
+            .text()
             .await?;
 
         Ok(res)
